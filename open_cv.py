@@ -1,28 +1,44 @@
 import cv2
+import socket
 from mjpeg_streamer import MjpegServer, Stream
 
-# 1. Open the camera (index 0 usually works)
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+HOST = "0.0.0.0"
+PORT = 8080
+STREAM_NAME = "my_camera"
+
 cap = cv2.VideoCapture(0)
+stream = Stream(STREAM_NAME, size=(640, 480), quality=50, fps=30)
 
-# 2. Configure the stream (size, quality, fps)
-stream = Stream("my_camera", size=(640, 480), quality=50, fps=30)
-
-# 3. Start the HTTP server on port 8080
-server = MjpegServer("0.0.0.0", 8080) # Use 0.0.0.0 for network access
+server = MjpegServer(HOST, PORT)
 server.add_stream(stream)
 server.start()
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    # 4. Feed frames to the stream
-    stream.set_frame(frame)
-    # (Optional) display locally
-    # cv2.imshow(stream.name, frame)
-    # if cv2.waitKey(1) == ord("q"): break
+# ---- Print access info ----
+ip = get_local_ip()
+print("=" * 50)
+print(f"📡 MJPEG stream is live!")
+print(f"   Local:    http://127.0.0.1:{PORT}/{STREAM_NAME}")
+print(f"   Network:  http://{ip}:{PORT}/{STREAM_NAME}")
+print("=" * 50)
 
-# Cleanup
-cap.release()
-cv2.destroyAllWindows()
-server.stop()
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        stream.set_frame(frame)
+finally:
+    cap.release()
+    server.stop()
+    print("\n🛑 Stream stopped.")
