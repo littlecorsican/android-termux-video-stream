@@ -2,18 +2,22 @@
 
 import os
 import socket
-import subprocess
 import time
+import subprocess
 from flask import Flask, Response
 
 app = Flask(__name__)
 
+# Ensure a safe directory exists for temporary frame handling
+TMP_DIR = "/data/data/com.termux/files/usr/tmp"
+os.makedirs(TMP_DIR, exist_ok=True)
+FRAME_PATH = os.path.join(TMP_DIR, "live_frame.jpg")
+
 def get_ip_address():
-    """Dynamically get the device's local network IP address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
+        ip = s.getsockname()
     except Exception:
         ip = '127.0.0.1'
     finally:
@@ -21,62 +25,57 @@ def get_ip_address():
     return ip
 
 def generate_frames():
-    """
-    Loops continuously taking snapshot bytes from termux-camera-photo
-    and streams them sequentially to create an MJPEG video stream.
-    """
-    # -c 0 specifies the back camera. Use -c 1 for front camera.
-    # The output is sent to stdout using the trailing hyphen '-'
-    cmd = ["termux-camera-photo", "-c", "0", "-"]
+    # Use -c 0 for back camera, -c 1 for front camera
+    # We point to a hard file path instead of '-' to stop the stream deadlock
+    cmd = ["termux-camera-photo", "-c", "0", FRAME_PATH]
     
     while True:
         try:
-            # Execute the photo snapshot command and capture raw byte output
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            frame = process.stdout
+            # 1. Force kill any stuck camera instances before taking a new image
+            subprocess.run(["pkill", "-f", "com.termux.api"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Ensure we got actual picture data before serving it
-            if frame:
+            # 2. Capture a fresh frame to disk
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3)
+            
+            # 3. Read the frame bytes if the file exists and has data
+            if os.path.exists(FRAME_PATH) and os.path.getsize(FRAME_PATH) > 0:
+                with open(FRAME_PATH, "rb") as f:
+                    frame = f.read()
+                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
             
-            # Tiny sleep interval to prevent CPU throttling (adjust for speed vs battery)
-            time.sleep(0.05)
+            # Frame rate delay (approx. 10-15 fps depending on device speed)
+            time.sleep(0.08)
             
+        except subprocess.TimeoutExpired:
+            print("[!] Camera operation timed out. Resetting context...")
+            continue
         except Exception as e:
-            print(f"\n[!] Stream Error: {e}")
+            print(f"[!] Stream loop error: {e}")
             break
 
 @app.route('/video_feed')
 def video_feed():
-    """HTTP Stream Route providing the multipart boundary output."""
-    return Response(
-        generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
     PORT = 5000
     IP_ADDR = get_ip_address()
     
-    # Automatically engage CPU lock when starting so it runs when screen turns off
     print("[*] Engaging Termux Wake-Lock...")
     os.system('termux-wake-lock &')
     
     print("=" * 50)
-    print("      TERMUX API CAMERA SERVER IS ALIVE        ")
+    print(f"[*] Live Streaming URL: http://{IP_ADDR}:{PORT}/video_feed")
     print("=" * 50)
-    print(f"[*] Local Host IP Address: {IP_ADDR}")
-    print(f"[*] Live Streaming URL   : http://{IP_ADDR}:{PORT}/video_feed")
-    print("=" * 50)
-    print("[ Press Ctrl+C to stop the stream server safely ]\n")
     
     try:
-        # Run the server accessible to any device on the local network
         app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[*] Shutting down server...")
     finally:
-        # Clean up and release the CPU lock so your battery can rest
         print("[*] Releasing Termux Wake-Lock...")
         os.system('termux-wake-unlock &')
+        if os.path.exists(FRAME_PATH):
+            os.remove(FRAME_PATH)
