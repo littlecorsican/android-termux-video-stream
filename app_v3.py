@@ -1,18 +1,10 @@
-# use mmjpeg
-
-
-
 import os
 import socket
 import subprocess
+import time
 from flask import Flask, Response
 
 app = Flask(__name__)
-
-# --- CONFIGURATION ---
-# Change this to the exact address provided by your camera app.
-# Note: For IP Webcam, adding '/video' or '/shot.jpg' provides the raw stream hook.
-CAMERA_STREAM_URL = "http://127.0.0" 
 
 def get_ip_address():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -25,43 +17,40 @@ def get_ip_address():
         s.close()
     return ip
 
-def generate_video_stream():
-    """
-    Uses FFmpeg to ingest the hardware stream and convert it to a 
-    standard MJPEG stream block by block in memory.
-    """
-    # FFmpeg parses the input stream and spits out raw MJPEG packets to stdout '-'
-    cmd = [
-        'ffmpeg',
-        '-i', CAMERA_STREAM_URL,
-        '-an',                 # Disable audio processing
-        '-c:v', 'mjpeg',       # Convert stream packets cleanly to MJPEG
-        '-q:v', '5',           # Video quality compression level (1-31, lower is better quality)
-        '-f', 'mpjpeg',        # Enforce the motion jpeg network format container
-        '-'
-    ]
+def generate_frames():
+    # Enforce standard photo command streaming out to stdout '-'
+    cmd = ["termux-camera-photo", "-c", "0", "-"]
     
-    # Spawn FFmpeg as an internal process pipeline
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    
-    try:
-        while True:
-            # Read image packet chunks out of RAM memory
-            data = process.stdout.read(4096)
-            if not data:
-                break
-            yield data
-    except Exception as e:
-        print(f"[!] Streaming Error: {e}")
-    finally:
-        process.terminate()
+    while True:
+        try:
+            # Explicitly clear out old API bindings to prevent hardware locks
+            subprocess.run(["pkill", "-f", "com.termux.api"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Fetch the raw picture snapshot directly into RAM memory bytes
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4)
+            frame = result.stdout
+            
+            # Verify the output is a valid JPEG byte-string structure
+            if frame and frame.startswith(b'\xff\xd8'):
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' + 
+                       frame + b'\r\n')
+            
+            # Minimal sleep buffer so your processor can handle the incoming cycles
+            time.sleep(0.05)
+            
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception as e:
+            print(f"[!] Frame Loop Issue: {e}")
+            break
 
 @app.route('/video_feed')
 def video_feed():
-    # Return the clean, browser-native multipart mixed replace stream protocol
     return Response(
-        generate_video_stream(), 
-        mimetype='multipart/x-mixed-replace; boundary=--ffmpeg'
+        generate_frames(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
 if __name__ == '__main__':
@@ -72,15 +61,17 @@ if __name__ == '__main__':
     os.system('termux-wake-lock &')
     
     print("=" * 50)
-    print("      HIGH-PERFORMANCE BROWSER STREAM SERVER        ")
+    print("         PURE TERMUX NATIVE STREAM SERVER          ")
     print("=" * 50)
     print(f"[*] Local Host IP Address: {IP_ADDR}")
     print(f"[*] Live Streaming URL   : http://{IP_ADDR}:{PORT}/video_feed")
     print("=" * 50)
+    print("[ Press Ctrl+C to stop the stream server safely ]\n")
     
     try:
         app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[*] Shutting down server...")
     finally:
+        print("[*] Releasing Termux Wake-Lock...")
         os.system('termux-wake-unlock &')
