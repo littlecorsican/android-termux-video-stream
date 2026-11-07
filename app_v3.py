@@ -1,15 +1,17 @@
-# use mmpeg
+# use mmjpeg
+
+
 
 import os
 import socket
 import subprocess
-import time
 from flask import Flask, Response
 
 app = Flask(__name__)
 
-# Change this to the address provided by your native camera streamer app
-# This connects the python engine directly to the high-speed camera stream
+# --- CONFIGURATION ---
+# Change this to the exact address provided by your camera app.
+# Note: For IP Webcam, adding '/video' or '/shot.jpg' provides the raw stream hook.
 CAMERA_STREAM_URL = "http://127.0.0" 
 
 def get_ip_address():
@@ -25,26 +27,26 @@ def get_ip_address():
 
 def generate_video_stream():
     """
-    Uses FFmpeg to ingest the hardware-accelerated video stream,
-    remuxes it cleanly in memory, and pipes it straight to the web browser
-    at a flawless 30 frames per second.
+    Uses FFmpeg to ingest the hardware stream and convert it to a 
+    standard MJPEG stream block by block in memory.
     """
-    # FFmpeg command to pull the stream instantly with zero caching lag
+    # FFmpeg parses the input stream and spits out raw MJPEG packets to stdout '-'
     cmd = [
         'ffmpeg',
         '-i', CAMERA_STREAM_URL,
-        '-f', 'mp4',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-an', # Remove audio to save network bandwidth
-        '-vcodec', 'copy', # Directly copy the hardware bytes without re-encoding (ultra-fast!)
+        '-an',                 # Disable audio processing
+        '-c:v', 'mjpeg',       # Convert stream packets cleanly to MJPEG
+        '-q:v', '5',           # Video quality compression level (1-31, lower is better quality)
+        '-f', 'mpjpeg',        # Enforce the motion jpeg network format container
         '-'
     ]
     
+    # Spawn FFmpeg as an internal process pipeline
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     
     try:
         while True:
-            # Read real video stream packets chunk by chunk out of RAM memory
+            # Read image packet chunks out of RAM memory
             data = process.stdout.read(4096)
             if not data:
                 break
@@ -56,8 +58,11 @@ def generate_video_stream():
 
 @app.route('/video_feed')
 def video_feed():
-    # Serves a professional native MP4 live video feed
-    return Response(generate_video_stream(), mimetype='video/mp4')
+    # Return the clean, browser-native multipart mixed replace stream protocol
+    return Response(
+        generate_video_stream(), 
+        mimetype='multipart/x-mixed-replace; boundary=--ffmpeg'
+    )
 
 if __name__ == '__main__':
     PORT = 5000
@@ -67,7 +72,7 @@ if __name__ == '__main__':
     os.system('termux-wake-lock &')
     
     print("=" * 50)
-    print("      REFINED HIGH-PERFORMANCE VIDEO SERVER        ")
+    print("      HIGH-PERFORMANCE BROWSER STREAM SERVER        ")
     print("=" * 50)
     print(f"[*] Local Host IP Address: {IP_ADDR}")
     print(f"[*] Live Streaming URL   : http://{IP_ADDR}:{PORT}/video_feed")
