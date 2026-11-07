@@ -2,65 +2,84 @@ import os
 import socket
 import subprocess
 import time
+import threading
 from flask import Flask, Response
 
 app = Flask(__name__)
 
-# --- STORAGE CONFIGURATION ---
-# We write to a dedicated live buffer file inside Termux's local storage path
+# System paths
 TMP_DIR = "/data/data/com.termux/files/usr/tmp"
 os.makedirs(TMP_DIR, exist_ok=True)
 FRAME_PATH = os.path.join(TMP_DIR, "live_frame.jpg")
+
+# Global variables to store the image buffer in RAM memory
+latest_frame = b''
+frame_lock = threading.Lock()
 
 def get_ip_address():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()
+        ip = s.getsockname()[0]
     except Exception:
         ip = '127.0.0.1'
     finally:
         s.close()
     return ip
 
-def generate_frames():
-    # Points cleanly to the exact file path instead of the invalid '-' pipe
+def camera_capture_thread():
+    """
+    Runs completely independently in the background.
+    Continuously snapshots the camera hardware and updates the RAM memory buffer.
+    """
+    global latest_frame
     cmd = ["termux-camera-photo", "-c", "0", FRAME_PATH]
     
+    print("[*] Background Camera Thread Started.")
     while True:
         try:
-            # 1. Clear out stuck API instances so the camera hardware stays completely loose
+            # Force close old API holds
             subprocess.run(["pkill", "-f", "com.termux.api"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # 2. Capture a fresh snapshot onto the disk buffer
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+            # Capture snapshot to file
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4)
             
-            # 3. Read the image data out immediately if it exists and has content
+            # If the image was successfully captured, read it straight into RAM
             if os.path.exists(FRAME_PATH) and os.path.getsize(FRAME_PATH) > 0:
                 with open(FRAME_PATH, "rb") as f:
-                    frame = f.read()
+                    data = f.read()
                 
-                # Standard HTTP multipart frame boundaries so the browser catches it instantly
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' + 
-                       frame + b'\r\n')
+                # Safely update the global frame pointer using a thread lock
+                with frame_lock:
+                    latest_frame = data
             
-            # Short delay interval to let your phone's processor catch up
-            time.sleep(0.1)
+            # Tiny sleep to allow thread context switching
+            time.sleep(0.01)
             
-        except subprocess.TimeoutExpired:
-            continue
         except Exception as e:
-            print(f"[!] Frame Engine Error: {e}")
-            break
+            print(f"\n[!] Camera Thread Warning: {e}")
+            time.sleep(1)
+
+def generate_frames():
+    """Serves the latest frame stored in RAM instantly to the web browser."""
+    global latest_frame
+    while True:
+        with frame_lock:
+            # Copy the current frame data out of the lock block quickly
+            frame = latest_frame
+        
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n'
+                   b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n' + 
+                   frame + b'\r\n')
+        
+        # Target ~10 frame checks per second for the browser delivery loop
+        time.sleep(0.1)
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(
-        generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
     PORT = 5000
@@ -69,8 +88,12 @@ if __name__ == '__main__':
     print("[*] Engaging Termux Wake-Lock...")
     os.system('termux-wake-lock &')
     
+    # --- LAUNCH CAMERA ON A INDEPENDENT WORKER THREAD ---
+    cam_thread = threading.Thread(target=camera_capture_thread, daemon=True)
+    cam_thread.start()
+    
     print("=" * 50)
-    print("         PURE TERMUX LOCAL-BUFFER SERVER           ")
+    print("       THREAD-DECOUPLED NATIVE STREAM SERVER       ")
     print("=" * 50)
     print(f"[*] Local Host IP Address: {IP_ADDR}")
     print(f"[*] Live Streaming URL   : http://{IP_ADDR}:{PORT}/video_feed")
@@ -78,12 +101,11 @@ if __name__ == '__main__':
     print("[ Press Ctrl+C to stop the stream server safely ]\n")
     
     try:
-        # threaded=True gives Flask the ability to serve the layout even while waiting on hardware
+        # Run Flask server normally
         app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[*] Shutting down server...")
     finally:
-        print("[*] Releasing Termux Wake-Lock...")
         os.system('termux-wake-unlock &')
         if os.path.exists(FRAME_PATH):
             os.remove(FRAME_PATH)
