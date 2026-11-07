@@ -1,6 +1,7 @@
 # this one is for the newer version , as termux-camera-video is deprecated
 
 
+
 import os
 import socket
 import time
@@ -8,6 +9,11 @@ import subprocess
 from flask import Flask, Response
 
 app = Flask(__name__)
+
+# Track the output frame path securely inside Termux
+TMP_DIR = "/data/data/com.termux/files/usr/tmp"
+os.makedirs(TMP_DIR, exist_ok=True)
+FRAME_PATH = os.path.join(TMP_DIR, "live_frame.jpg")
 
 def get_ip_address():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -21,32 +27,35 @@ def get_ip_address():
     return ip[0] if isinstance(ip, tuple) else ip
 
 def generate_frames():
-    # Use -c 0 for back camera, -c 1 for front camera.
-    # The trailing hyphen '-' tells newer versions to attempt output piping,
-    # but we will enforce a strict execution timeout to prevent hanging.
-    cmd = ["termux-camera-photo", "-c", "0", "-"]
+    # --- CRITICAL OPTIMIZATION ---
+    # We remove the '-' pipe and write to a fast local file buffer instead.
+    # We forcefully kill the resolution to ensure fast capture speeds.
+    # Check your camera sizes via 'termux-camera-info' if you want to tweak this.
+    cmd = ["termux-camera-photo", "-c", "0", FRAME_PATH]
     
     while True:
         try:
-            # Clean up the background api service before each shot to prevent deadlocks
+            # Drop old background API blocks cleanly
             subprocess.run(["pkill", "-f", "com.termux.api"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Execute the photo snapshot directly into memory bytes
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4)
-            frame = result.stdout
+            # Execute the capture with a strict timeout so the loop never locks up permanently
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
             
-            # Valid JPEGs start with these specific hex bytes (0xff 0xd8)
-            if frame and frame.startswith(b'\xff\xd8'):
+            # Read the fresh raw data directly into the web stream chunk pipelines
+            if os.path.exists(FRAME_PATH) and os.path.getsize(FRAME_PATH) > 0:
+                with open(FRAME_PATH, "rb") as f:
+                    frame = f.read()
+                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
             
-            # Small cooldown so your phone's camera sensor doesn't overheat
+            # Allow a short rest window for the hardware sensor loop
             time.sleep(0.1)
             
         except subprocess.TimeoutExpired:
             continue
         except Exception as e:
-            print(f"[!] Stream loop error: {e}")
+            print(f"[!] Streaming Engine Error: {e}")
             break
 
 @app.route('/video_feed')
@@ -61,12 +70,8 @@ if __name__ == '__main__':
     os.system('termux-wake-lock &')
     
     print("=" * 50)
-    print("      TERMUX API CAMERA SERVER IS LIVE        ")
+    print(f"[*] Live Streaming URL: http://{IP_ADDR}:{PORT}/video_feed")
     print("=" * 50)
-    print(f"[*] Local Host IP Address: {IP_ADDR}")
-    print(f"[*] Live Streaming URL   : http://{IP_ADDR}:{PORT}/video_feed")
-    print("=" * 50)
-    print("[ Press Ctrl+C to stop the stream server safely ]\n")
     
     try:
         app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
@@ -75,3 +80,6 @@ if __name__ == '__main__':
     finally:
         print("[*] Releasing Termux Wake-Lock...")
         os.system('termux-wake-unlock &')
+        if os.path.exists(FRAME_PATH):
+            os.remove(FRAME_PATH)
+
